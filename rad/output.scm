@@ -6,12 +6,16 @@
 
    (import
       (owl base)
+      (owl iff)
       (owl io)
       (only (owl primop) halt)
+      (rad digest)
       (rad shared))
 
    (export
       output
+      checksummer dummy-checksummer
+      dummy-output        ;; construct, but don't write
       string->outputs)    ;; str num → ll of output functions | #false
 
    (begin
@@ -21,12 +25,57 @@
          (lets 
             ((ll n (blocks->port ll fd))
              (ok? (and (pair? ll) (tuple? (car ll)))) ;; all written?
-             (state (lfold (λ (last block) block) #false ll)) ;; find the last tuple
+             (state (car ll))
              (rs muta meta state))
             (if (not (eq? fd stdout))
                (close-port fd))
             ;; could warn about write errors
             (values rs muta meta n)))
+
+      ;; compute and discard (for fast forwardng)
+      (define (dummy-output ll)
+        (lets
+          ((state (lfold (λ (prev this) this) #f ll))
+           (rs muta meta state))
+          (values rs muta meta)))
+
+      (define (stream-chunk buff pos tail)
+         (if (eq? pos 0)
+            (cons (refb buff pos) tail)
+            (lets ((next x (fx- pos 1)))
+               (stream-chunk buff next
+                  (cons (refb buff pos) tail)))))
+
+      (define (output-stream->byte-stream lst)
+         (foldr 
+            (lambda (node tl)
+               (if (vector? node)
+                  (lambda ()
+                     (let ((len (vector-length node)))
+                        (if (eq? len 0)
+                           tl
+                           (stream-chunk node (- len 1) tl))))
+                  tl))
+            null lst))
+
+      ;;;
+      ;;; Checksum computing and uniqueness filtering
+      ;;;
+   
+      ;; force all and compute payload checksum 
+      ;; ll -> forced-ll checksum
+      (define (checksummer cs ll)
+         (lets
+            ((lst (force-ll ll))
+             (bs (output-stream->byte-stream lst))
+             (csum (digest bs)))
+            (if (dget cs csum)
+               (values lst cs #false)
+               (values lst (dput cs csum) csum))))
+      
+      ;; dummy checksum, does not not force stream
+      (define (dummy-checksummer cs ll)
+         (values ll cs "0"))
 
       (define (stdout-stream meta)
          (values stdout-stream stdout 
@@ -43,10 +92,27 @@
                   (else ;; no more numbers
                      (values (cons x ll) n))))))
 
+      (define default-path ".rad")
+      (define default-suffix (cdr (string->list default-path)))
+
+      (define (suffix-char? x) 
+        (not (has? '(#\. #\/ #\\) x)))
+
+      (define (path-suffix path default) 
+        (lets ((hd tl (take-while suffix-char? (reverse (string->list path)))))
+          (if (and (pair? tl) (eq? (car tl) #\.))
+            (reverse hd)
+            default-suffix)))
+
+      (define (source-path meta def)
+        (or (get meta 'source #false) ;; file generator
+            (get meta 'head #false)   ;; jump generator (head -> tail) 
+            def))
+
       (define (file-writer pat suf)
          (define (gen meta)
             (lets 
-               ((path ;; <- could also just regex it there
+               ((path
                   (runes->string
                      (str-foldr
                         (λ (char tl)
@@ -56,7 +122,8 @@
                               ((and (eq? char #\%) (pair? tl))
                                  (case (car tl)
                                     ((#\n) (render (get meta 'nth 0) (cdr tl)))
-                                    ((#\s) (append suf (cdr tl)))
+                                    ((#\s) (append (path-suffix (source-path meta default-path) default-path) (cdr tl)))
+                                    ((#\p) (append suf (cdr tl)))
                                     ((#\0) ;; %0[0-9]+n -> testcase number with padding
                                        (lets
                                           ((tlp pad (get-natural tl))
@@ -79,7 +146,7 @@
                                        (print*-to stderr
                                           (list "Warning: unknown pattern in output path: '" 
                                              (list->string (list char (car tl)))
-                                             "'. Did you mean '%n'?"))
+                                             "'. Did you mean '%n, %s or %p'?"))
                                        (cons char tl))))
                               (else (cons char tl))))
                         null pat)))
